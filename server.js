@@ -72,6 +72,7 @@ function createRoom(hostId, hostName) {
     hostId,
     users: new Map(),
     media: null,        // { type: 'youtube'|'file', url, title }
+    readyUsers: new Set(),
     playback: {
       playing: false,
       position: 0,       // seconds
@@ -183,6 +184,7 @@ io.on('connection', (socket) => {
     if (!room || room.hostId !== userId) return;
 
     room.media = { type, url, title };
+    room.readyUsers.clear();
     room.playback = { playing: false, position: 0, lastSyncTime: null };
 
     io.to(currentRoom).emit('media-loaded', {
@@ -191,13 +193,26 @@ io.on('connection', (socket) => {
     });
   });
 
+  // ─ Media Ready (Buffering completely) ─
+  socket.on('media-ready', () => {
+    if (!currentRoom) return;
+    const room = rooms.get(currentRoom);
+    if (!room || !room.media) return;
+
+    room.readyUsers.add(userId);
+    // If all users in the room have buffered, tell them they can play
+    if (room.readyUsers.size === room.users.size) {
+      io.to(currentRoom).emit('all-ready');
+    }
+  });
+
   // ─ Play ─
   socket.on('play', ({ position }) => {
     if (!currentRoom) return;
     const room = rooms.get(currentRoom);
     if (!room || room.hostId !== userId) return;
 
-    const executeAt = Date.now() + 300; // 300ms in the future
+    const executeAt = Date.now() + 800; // 800ms in the future
     room.playback.playing = true;
     room.playback.position = position != null ? position : getExpectedPosition(room);
     room.playback.lastSyncTime = executeAt;
@@ -218,7 +233,7 @@ io.on('connection', (socket) => {
     room.playback.position = position != null ? position : getExpectedPosition(room);
     room.playback.lastSyncTime = Date.now();
 
-    const executeAt = Date.now() + 300;
+    const executeAt = Date.now() + 800;
     io.to(currentRoom).emit('sync-pause', {
       position: room.playback.position,
       executeAt,
@@ -234,7 +249,7 @@ io.on('connection', (socket) => {
     room.playback.position = position;
     room.playback.lastSyncTime = Date.now();
 
-    const executeAt = Date.now() + 300;
+    const executeAt = Date.now() + 800;
     io.to(currentRoom).emit('sync-seek', {
       position,
       executeAt,
@@ -251,13 +266,14 @@ io.on('connection', (socket) => {
     const expected = getExpectedPosition(room);
     const drift = position - expected;
 
-    // If drift > 100ms, send correction
-    if (Math.abs(drift) > 0.1) {
+    // Send correction if drift > 50ms, else send sync-ok to reset playback rate
+    if (Math.abs(drift) > 0.05) {
       socket.emit('drift-correction', {
         expectedPosition: expected,
-        yourPosition: position,
         drift,
       });
+    } else {
+      socket.emit('sync-ok');
     }
   });
 

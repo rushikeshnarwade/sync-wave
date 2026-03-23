@@ -17,6 +17,9 @@
         html5Player: null,   // <video> or <audio> element
         activePlayerType: null, // 'youtube' | 'video' | 'audio'
         isPlaying: false,
+        isReady: false,
+        allReady: true,
+        playbackRate: 1.0,
         duration: 0,
         suppressEvents: false,
         heartbeatInterval: null,
@@ -114,6 +117,24 @@
         } else {
             dom.mediaPanel.classList.add('host-only-disabled');
             dom.placeholderHint.textContent = 'Waiting for host to load media...';
+        }
+        updatePlayButtonState();
+    }
+
+    function updatePlayButtonState() {
+        if (!state.isHost) {
+            dom.btnPlay.style.opacity = '1';
+            dom.btnPlay.style.cursor = 'pointer';
+            return;
+        }
+        if (!state.allReady && state.media) {
+            dom.btnPlay.style.opacity = '0.4';
+            dom.btnPlay.style.cursor = 'not-allowed';
+            dom.btnPlay.title = 'Waiting for all users to buffer...';
+        } else {
+            dom.btnPlay.style.opacity = '1';
+            dom.btnPlay.style.cursor = 'pointer';
+            dom.btnPlay.title = 'Play';
         }
     }
 
@@ -244,6 +265,16 @@
         }
     }
 
+    function playerSetPlaybackRate(rate) {
+        if (state.playbackRate === rate) return;
+        state.playbackRate = rate;
+        if (state.activePlayerType === 'youtube' && state.ytPlayer) {
+            state.ytPlayer.setPlaybackRate(rate);
+        } else if (state.html5Player) {
+            state.html5Player.playbackRate = rate;
+        }
+    }
+
     function updateVolumeIcon() {
         const muted = playerIsMuted();
         dom.volIcon.style.display = muted ? 'none' : 'block';
@@ -319,10 +350,12 @@
 
         state.activePlayerType = 'youtube';
         state.media = { type: 'youtube', url: videoId, title };
+        state.isReady = false;
+        state.allReady = false;
+        updatePlayButtonState();
 
         if (state.ytPlayer && state.ytReady) {
-            state.ytPlayer.loadVideoById(videoId);
-            state.ytPlayer.pauseVideo();
+            state.ytPlayer.cueVideoById(videoId);
         } else {
             // YT player will be created in onYouTubeIframeAPIReady
             createYouTubePlayer(videoId);
@@ -368,6 +401,9 @@
         }
 
         state.media = { type: isAudio ? 'audio' : 'video', url, title };
+        state.isReady = false;
+        state.allReady = false;
+        updatePlayButtonState();
         showMediaUI(title);
     }
 
@@ -412,8 +448,16 @@
                 onReady: () => {
                     state.ytReady = true;
                     state.ytPlayer.setVolume(parseInt(dom.volumeSlider.value, 10));
+                    if (!state.isReady) {
+                        state.isReady = true;
+                        state.socket.emit('media-ready');
+                    }
                 },
                 onStateChange: (event) => {
+                    if (!state.isReady && (event.data === YT.PlayerState.CUED || event.data === YT.PlayerState.UNSTARTED)) {
+                        state.isReady = true;
+                        state.socket.emit('media-ready');
+                    }
                     if (state.suppressEvents) return;
                     // We don't auto-sync on YT state changes to avoid loops
                 },
@@ -440,6 +484,8 @@
         // ─ Media Loaded ─
         state.socket.on('media-loaded', ({ media, playback }) => {
             if (!media) return;
+            state.allReady = false;
+            updatePlayButtonState();
             if (media.type === 'youtube') {
                 const videoId = extractYoutubeId(media.url) || media.url;
                 loadYoutubeVideo(videoId, media.title);
@@ -448,6 +494,13 @@
                 loadLocalFile(media.url, media.title, isAudio);
             }
             toast(`Now playing: ${media.title}`, 'info');
+        });
+
+        // ─ All Ready ─
+        state.socket.on('all-ready', () => {
+            state.allReady = true;
+            updatePlayButtonState();
+            toast('Everyone is ready!', 'success');
         });
 
         // ─ Sync Play ─
@@ -480,9 +533,47 @@
 
         // ─ Drift Correction ─
         state.socket.on('drift-correction', ({ expectedPosition, drift }) => {
-            if (Math.abs(drift) > 0.05) {
+            // drift = myPosition - expectedPosition
+            if (Math.abs(drift) > 1.0) {
+                // Severe drift (>1000ms), snap to expected position
                 playerSeek(expectedPosition);
+                playerSetPlaybackRate(1.0);
                 updateSyncStatus('synced');
+                if (state.recoveryTimeout) {
+                    clearTimeout(state.recoveryTimeout);
+                    state.recoveryTimeout = null;
+                }
+            } else if (Math.abs(drift) > 0.05) {
+                // Micro-sync playback rate with exact duration math
+                const isBehind = drift < 0;
+                const newRate = isBehind ? 1.05 : 0.95;
+                const rateDiff = Math.abs(1.0 - newRate); // 0.05
+                
+                // Calculate exact milliseconds needed to hit perfect sync
+                const recoverySeconds = Math.abs(drift) / rateDiff;
+                const recoveryMs = recoverySeconds * 1000;
+
+                playerSetPlaybackRate(newRate);
+                updateSyncStatus('drifting');
+
+                if (state.recoveryTimeout) {
+                    clearTimeout(state.recoveryTimeout);
+                }
+
+                state.recoveryTimeout = setTimeout(() => {
+                    playerSetPlaybackRate(1.0);
+                    updateSyncStatus('synced');
+                    state.recoveryTimeout = null;
+                }, recoveryMs);
+            }
+        });
+
+        state.socket.on('sync-ok', () => {
+            playerSetPlaybackRate(1.0);
+            updateSyncStatus('synced');
+            if (state.recoveryTimeout) {
+                clearTimeout(state.recoveryTimeout);
+                state.recoveryTimeout = null;
             }
         });
 
@@ -694,6 +785,9 @@
         // Play/Pause
         dom.btnPlay.addEventListener('click', () => {
             if (!state.isHost || !state.media) return;
+            if (!state.allReady) {
+                return toast('Waiting for all users to buffer...', 'info');
+            }
             const pos = playerGetCurrentTime();
             if (state.isPlaying) {
                 state.socket.emit('pause', { position: pos });
@@ -738,6 +832,12 @@
             player.addEventListener('loadedmetadata', () => {
                 state.duration = player.duration;
                 dom.timeDuration.textContent = formatTime(player.duration);
+            });
+            player.addEventListener('canplaythrough', () => {
+                if (!state.isReady) {
+                    state.isReady = true;
+                    state.socket.emit('media-ready');
+                }
             });
         });
     }
